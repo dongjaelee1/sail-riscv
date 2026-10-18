@@ -246,16 +246,20 @@ private function compare_address forall 'width, 0 < 'width <= max_mem_access. (
   None();
 }
 
-private function compare_value forall 'width, is_mem_width_wide('width) . (
+// `value` is the accessed value zero-extended to `trigger_data_bits` and
+// `width` its size in bytes (see `MemoryTriggerPayload`); the comparison
+// takes its low XLEN bits, which is the zero-extension of the original
+// `8 * width`-bit value whenever `width <= xlen_bytes`.
+private function compare_value(
   t_match : Trig_Match,
   t_size  : Trig_Match_Size,
-  value   : bits(8 * 'width),
-  width   : int('width),
+  value   : trigger_data,
+  width   : range(1, 16),
   tdata2  : xlenbits,
 ) -> bool = {
   // `tdata2` is of size XLEN, and accesses of larger size are not supported.
   if   width <= xlen_bytes & compare_access_size(t_size, width)
-  then compare_value_xlen(t_match, zero_extend(value), tdata2)
+  then compare_value_xlen(t_match, value[xlen - 1 .. 0], tdata2)
   else false
 }
 

@@ -253,7 +253,7 @@ function clause execute SSAMOSWAP(aq, rl, rs2, rs1, width, rd) = {
 
   // See `zaamo_insts.sail` for an explanation of the current implementation of
   // trigger handling for AMOs.
-  match_memory_trigger_after(cur_privilege, TriggerAMOData(bits_of(vaddr), mem_val, write_val, width));
+  match_memory_trigger_after(cur_privilege, TriggerAMOData(bits_of(vaddr), zero_extend(mem_val), zero_extend(write_val), width));
 
   RETIRE_SUCCESS
 }

@@ -261,7 +261,7 @@ function vmem_read_addr(vaddr, width, access, access_info, aq, rl, res) = {
   // implementation _does_ match in this case.  Trigger matching is
   // done for the current privilege, and not the effective privilege
   // of the access.
-  match_memory_trigger_after(cur_privilege, TriggerLoadData(bits_of(vaddr), data, width));
+  match_memory_trigger_after(cur_privilege, TriggerLoadData(bits_of(vaddr), zero_extend(data), width));
 
   Ok(data)
 }
@@ -311,7 +311,7 @@ function vmem_write_addr(vaddr, width, data, access, access_info, aq, rl, res) =
 
   // Trigger address and data matches have higher priority than Load/SAMO
   // misaligned exceptions and data memory protection faults.
-  match match_memory_trigger_before(cur_privilege, TriggerStore(bits_of(vaddr), data, width)) {
+  match match_memory_trigger_before(cur_privilege, TriggerStore(bits_of(vaddr), zero_extend(data), width)) {
     Some(pti) => return Err(PendingTrigger(pti)),
     None()    => (),
   };

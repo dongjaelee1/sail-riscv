@@ -155,7 +155,7 @@ private function run_hart_active(step_no: nat) -> Step = {
       sail_instr_announce(h);
       fetch_callback(h);
 
-      match match_memory_trigger_before(cur_privilege, TriggerFetchInstr(PC, h, 2)) {
+      match match_memory_trigger_before(cur_privilege, TriggerFetchInstr(PC, zero_extend(h), 2)) {
         Some(pti) => return Step_Fetch_Trigger(pti),
         None()    => (),
       };
@@ -193,7 +193,7 @@ private function run_hart_active(step_no: nat) -> Step = {
       sail_instr_announce(w);
       fetch_callback(w);
 
-      match match_memory_trigger_before(cur_privilege, TriggerFetchInstr(PC, w, 4)) {
+      match match_memory_trigger_before(cur_privilege, TriggerFetchInstr(PC, zero_extend(w), 4)) {
         Some(pti) => return Step_Fetch_Trigger(pti),
         None()    => (),
       };

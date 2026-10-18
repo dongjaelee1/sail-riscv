@@ -288,13 +288,22 @@ function make_textra(v : xlenbits) -> TExtra = {
 
 enum trigger_addr_type = {TriggerAddress_Load, TriggerAddress_Store, TriggerAddress_AMO}
 
+// The data payloads carry the accessed value zero-extended to the widest
+// memory access (16 bytes) together with its width in bytes, rather than a
+// width-indexed `bits(8 * 'width)` under an existential: the theorem-prover
+// backends (Lean) cannot represent existentially typed union constructors,
+// and the only consumer, `compare_value`, zero-extends the value to XLEN
+// anyway (accesses wider than XLEN never match).
+type trigger_data_bits : Int = 8 * 16
+type trigger_data = bits(trigger_data_bits)
+
 union MemoryTriggerPayload = {
   TriggerFetchAddr   : xlenbits,
-  TriggerFetchInstr  : {('width : Int), is_mem_width('width).         (xlenbits, bits(8 * 'width), int('width))},
+  TriggerFetchInstr  : (xlenbits, trigger_data, range(1, 8)),
   TriggerAddress     : {('width : Int), 0 < 'width <= max_mem_access. (trigger_addr_type, xlenbits, int('width))},
-  TriggerStore       : {('width : Int), is_mem_width_wide('width).    (xlenbits, bits(8 * 'width), int('width))},
-  TriggerLoadData    : {('width : Int), is_mem_width_wide('width).    (xlenbits, bits(8 * 'width), int('width))},
-  TriggerAMOData     : {('width : Int), is_mem_width_wide('width).    (xlenbits, /*load*/ bits(8 * 'width), /*store*/ bits(8 * 'width), int('width))},
+  TriggerStore       : (xlenbits, trigger_data, range(1, 16)),
+  TriggerLoadData    : (xlenbits, trigger_data, range(1, 16)),
+  TriggerAMOData     : (xlenbits, /*load*/ trigger_data, /*store*/ trigger_data, range(1, 16)),
 }
 
 type pending_trigger_info = (Trig_Action, trigger_index, xlenbits)
