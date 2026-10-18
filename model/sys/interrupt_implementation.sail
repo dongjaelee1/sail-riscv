@@ -9,9 +9,15 @@
 // This aggregates the information from the interrupts controllers in
 // the system, which currently are the CLINT and the SIG.
 
+// The external-interrupt pin registers (sig_meip, sig_seip, sig_hgeip) are
+// consulted whether or not the Simple Interrupt Generator's MMIO window is
+// present: a platform model outside this Sail model (xv6iris's PLIC device)
+// drives them directly.  `platform.simple_interrupt_generator.supported`
+// therefore gates only the SIG's MMIO window and its software-interrupt
+// sources, as it did before the pull-based interrupt interface.
 function external_interrupts_pending(hgeie_val : xlenbits) -> Minterrupts =
   // The CLINT doesn't deal with external interrupts.
-  if plat_have_sig then sig_external_interrupts_pending(hgeie_val) else Mk_Minterrupts(zeros())
+  sig_external_interrupts_pending(hgeie_val)
 
 function machine_software_interrupt_pending() -> bits(1) =
   (if plat_have_clint then clint_machine_software_interrupt_pending() else 0b0)
