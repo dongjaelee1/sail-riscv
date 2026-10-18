@@ -26,8 +26,6 @@ private function transformed_instruction(insn : instruction) -> option(bits(32))
   match insn {
     LOAD(_, _, rd, is_unsigned, width)     => Some(encdec(LOAD(zeros(), zreg, rd, is_unsigned, width))),
     STORE(_, rs2, _, width)                => Some(encdec(STORE(zeros(), rs2, zreg, width))),
-    LOAD_FP(_, _, rd, width)               => Some(encdec(LOAD_FP(zeros(), zreg, rd, width))),
-    STORE_FP(_, rs2, _, width)             => Some(encdec(STORE_FP(zeros(), rs2, zreg, width))),
     LOADRES(aq, rl, _, width, rd)          => Some(encdec(LOADRES(aq, rl, zreg, width, rd))),
     STORECON(aq, rl, rs2, _, width, rd)    => Some(encdec(STORECON(aq, rl, rs2, zreg, width, rd))),
     AMO(op, aq, rl, rs2, _, width, rd)     => Some(encdec(AMO(op, aq, rl, rs2, zreg, width, rd))),
