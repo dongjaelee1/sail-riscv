@@ -125,9 +125,12 @@ function getPendingSet(priv : Privilege) -> option((xlenbits, Privilege)) = {
   // for platform use (see
   // `core/interrupt_regs.sail:legalize_mideleg()`), but those
   // interrupts are not known in `findPendingInterrupt()` above.
+  // If the hypervisor extension is not currently enabled then ignore hideleg
+  // (it does not exist).
+  let hideleg_bits = if currentlyEnabled(Ext_H) then hideleg.bits else zeros();
   let pending_m  = pending & ~(mideleg_bits);
-  let pending_s  = pending &   mideleg_bits  & ~(hideleg.bits);
-  let pending_vs = pending &   mideleg_bits  &   hideleg.bits;
+  let pending_s  = pending &   mideleg_bits  & ~(hideleg_bits);
+  let pending_vs = pending &   mideleg_bits  &   hideleg_bits;
 
   let mIE  = (priv == Machine           & mstatus[MIE] == 0b1)  | priv != Machine;
   let sIE  = (priv == Supervisor        & mstatus[SIE] == 0b1)  | priv == User | priv == VirtualSupervisor | priv == VirtualUser;
