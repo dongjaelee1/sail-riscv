@@ -39,6 +39,26 @@ struct PTW_Output('v : Int), is_sv_or_svx4_mode('v) = {
 
 private type PTW_Result('v : Int), is_sv_or_svx4_mode('v) = result((PTW_Output('v), ext_ptw), (PTW_Error, ext_ptw))
 
+// The outcome of the atomic A/D-bit update of a leaf PTE (Step 7 of the
+// VATP), when it is not a PTW_Error.  See update_and_write_pte().
+union PTE_Update_Result('v : Int), is_sv_or_svx4_mode('v) = {
+  // Some(pte): the PTE was written and now holds pte, the walked value
+  // with its new A/D bits; None(): the walked value needs no new bits.
+  PTE_Update_Done  : option(pte_bits('v)),
+  // The PTE in memory differs from the value the walk used: the spec's
+  // "return to step 2" -- the caller walks again.
+  PTE_Update_Retry : unit,
+}
+
+// How many times a translation walks again after Step 7's comparison has
+// failed before the model gives up.  The spec's loop is unbounded (a hart
+// retries for as long as other agents keep changing the PTE); the model
+// bounds it and stops the hart (internal_error) at the bound.  Any bound is
+// a modelling choice; the retry count is the number of CONCURRENT changes
+// to one PTE during one translation, so a small bound is never reached in
+// practice.
+let pte_update_max_retries : nat = 16
+
 // Result of address translation
 type TR_Result('paddr : Type, 'failure : Type) = result(('paddr, page_based_mem_type, ext_ptw), ('failure, ext_ptw))
 
@@ -108,10 +128,7 @@ termination_measure translate_PTE_addr(_, _, _, _) = 1000
 
 // Check a leaf PTE and compute the translated PPN and the PBMT (Steps 3
 // and 5-8 of the VATP; Step 4, following valid non-leaf PTEs, is handled
-// in pt_walk()).  This is used by pt_walk() when it reaches a leaf PTE,
-// and again by update_and_write_pte() to atomically re-perform all
-// tablewalk checks on the freshly read PTE value as part of an A/D-bit
-// update, as required by the spec (see update_and_write_pte()).
+// in pt_walk()).  This is used by pt_walk() when it reaches a leaf PTE.
 private function check_leaf_pte forall 'v, is_sv_or_svx4_mode('v) . (
   sv_width : int('v),
   vpn      : vpn_bits('v),
@@ -190,14 +207,16 @@ private function check_leaf_pte forall 'v, is_sv_or_svx4_mode('v) . (
 }
 
 // Update a PTE's A/D bits and write it to memory if needed.  This returns
-// * Ok(Some(pte), ext_ptw) if a write was needed and was successful. pte is the new value.
-// * Ok(None(), ext_ptw) if no write was needed.
+// * Ok(PTE_Update_Done(Some(pte)), ext_ptw) if a write was needed and was
+//   successful. pte is the new value.
+// * Ok(PTE_Update_Done(None()), ext_ptw) if no write was needed.
+// * Ok(PTE_Update_Retry(), ext_ptw) if a write was needed but the PTE in
+//   memory no longer equals the value the walk used: the caller walks again.
 // * Err(PTW_PTE_Needs_Update(), ext_ptw) if a write was needed but is forbidden by the current state.
 // * Err(PTW_Implicit_Error(..), ext_ptw) if a write was needed but the G-stage
 //   translation of the PTE's address failed (VS-stage only).
-// * Err(e, ext_ptw) if a write was needed but the atomic update failed,
-//   either because of a physical memory access error (PTW_No_Access()) or
-//   because the tablewalk checks failed on the freshly read PTE value.
+// * Err(PTW_No_Access(), ext_ptw) if a write was needed and attempted but
+//   there was a physical memory access error.
 //
 // The privileged spec requires the A/D-bit update to be atomic:
 //
@@ -212,10 +231,12 @@ private function check_leaf_pte forall 'v, is_sv_or_svx4_mode('v) . (
 //    access is a store, also set pte.d to 1.  If the comparison fails,
 //    return to step 2."
 //
-// This is modelled here as a single atomic read-check-write of the PTE:
-// re-read the PTE with an exclusive read, re-perform the tablewalk checks
-// on the freshly read value, and conditionally write back the fresh value
-// with updated A/D bits.
+// This is modelled here literally, as a single atomic compare-and-swap of
+// the PTE: re-read the PTE with an exclusive read, compare it with the
+// value the walk used (on which the tablewalk checks were performed), and
+// if they are equal conditionally write back that value with its new A/D
+// bits.  If they differ the PTE was changed since the walk read it, and
+// the caller returns to Step 2 (walks again).
 //
 // pteAddr is the address of the PTE as seen by the page-table walk: a
 // guest physical address for VS-stage translation (translated through the
@@ -223,20 +244,15 @@ private function check_leaf_pte forall 'v, is_sv_or_svx4_mode('v) . (
 // supervisor physical address otherwise.
 private function update_and_write_pte forall 'v, is_sv_or_svx4_mode('v) . (
   sv_width : int('v),
-  vpn      : vpn_bits('v),
   pteAddr  : physaddr,
   pte      : pte_bits('v),
-  level    : level_range('v),
   access   : MemoryAccessType(mem_payload),
-  priv     : Privilege,
-  mxr      : bool,
-  do_sum   : bool,
   stage    : TranslationStage,
   ext_ptw  : ext_ptw,
-) -> result((option(pte_bits('v)), ext_ptw), (PTW_Error, ext_ptw)) =
+) -> result((PTE_Update_Result('v), ext_ptw), (PTW_Error, ext_ptw)) =
   match update_PTE_Bits(pte, access, stage) {
-    None()  => Ok(None(), ext_ptw),
-    Some(_) => // The PTE needs new A/D bits.
+    None()        => Ok(PTE_Update_Done(None()), ext_ptw),
+    Some(pte_new) => // The PTE needs new A/D bits.
       if hw_updates_pte(stage) then {
         let 'pte_width = if sv_width == 32 | sv_width == 34 then 4 else 8;
         // Translate PTE address if performing a VS-stage access.  The
@@ -246,38 +262,30 @@ private function update_and_write_pte forall 'v, is_sv_or_svx4_mode('v) . (
           Ok(pa, _, _) => pa,
           Err(e, _)    => return Err(PTW_Implicit_Error(translationException(access, e), bits_of(pteAddr), Store(PageTableEntry)), ext_ptw),
         };
-        // Atomically: re-read the PTE, redo the tablewalk checks on the
-        // fresh value, and write the fresh value with updated A/D bits.
+        // Step 7, atomically: re-read the PTE, compare it with the value
+        // the walk used, and if they match write that value with its new
+        // A/D bits.
         match read_pte_exclusive(pte_paddr, pte_width) {
           Err(_) => Err(PTW_No_Access(), ext_ptw),
-          Ok(pte) =>
-            // A check failure means the PTE was concurrently modified
-            // since the walk read it; the resulting page fault is what
-            // the spec's "return to step 2" would produce.
-            match check_leaf_pte(sv_width, vpn, access, priv, mxr, do_sum, pte, pte_paddr, level, stage, ext_ptw) {
-              Err(e, ext_ptw)   => Err(e, ext_ptw),
-              Ok(_, _, ext_ptw) =>
-                match update_PTE_Bits(pte, access, stage) {
-                  // The fresh PTE already has the required A/D bits (they
-                  // were set concurrently since the walk read the PTE).
-                  None()    => Ok(Some(pte), ext_ptw),
-                  Some(pte) =>
-                    match write_pte_conditional(pte_paddr, pte_width, pte) {
-                      Ok(true)  => Ok(Some(pte), ext_ptw),
-                      // A failed conditional write corresponds to the
-                      // spec's "return to step 2" retry; as for the AMO
-                      // write in zaamo_insts.sail, it cannot occur in
-                      // the sequential emulator.
-                      Ok(false) => internal_error(__FILE__, __LINE__, "PTE conditional write failed"),
-                      Err(_)    => Err(PTW_No_Access(), ext_ptw),
-                    },
-                },
-            },
+          Ok(pte_fresh) =>
+            if pte_fresh != pte then
+              // The PTE was changed since the walk read it: "If the
+              // comparison fails, return to step 2."
+              Ok(PTE_Update_Retry(), ext_ptw)
+            else
+              match write_pte_conditional(pte_paddr, pte_width, pte_new) {
+                Ok(true)  => Ok(PTE_Update_Done(Some(pte_new)), ext_ptw),
+                // A failed conditional write would also be a "return to
+                // step 2"; as for the AMO write in zaamo_insts.sail, it
+                // cannot occur in the sequential emulator.
+                Ok(false) => internal_error(__FILE__, __LINE__, "PTE conditional write failed"),
+                Err(_)    => Err(PTW_No_Access(), ext_ptw),
+              },
         }
       } else Err(PTW_PTE_Needs_Update(), ext_ptw),
   }
 
-termination_measure update_and_write_pte(_, _, _, _, _, _, _, _, _, _, _) = 1000
+termination_measure update_and_write_pte(_, _, _, _, _, _) = 1000
 
 // 'v is the virtual address size.
 private val pt_walk : forall 'v, is_sv_or_svx4_mode('v) . (
@@ -479,13 +487,87 @@ private function hgatp_mode() -> HGATPMode = {
 // ****************************************************************
 // VA to PA translation
 
+// Translate on TLB miss: the page-table walk (Steps 2-8 of VATP), then the
+// A/D-bit update (Step 7's compare-and-swap, Step 9); if the comparison
+// fails, "return to step 2" -- walk again, while `retries` allows.
+private function translate_TLB_miss_retry forall 'v, is_sv_or_svx4_mode('v) . (
+  retries  : nat,
+  sv_width : int('v),
+  asid     : asidbits,
+  vmid     : vmidbits,
+  base_ppn : ppn_bits('v),
+  vpn      : vpn_bits('v),
+  access   : MemoryAccessType(mem_payload),
+  priv     : Privilege,
+  mxr      : bool,
+  do_sum   : bool,
+  stage    : TranslationStage,
+  ext_ptw  : ext_ptw,
+) -> TR_Result(ppn_bits('v), PTW_Error) = {
+  let initial_level = get_root_level(sv_width);
+
+  // Step 2 of VATP occurs in pt_walk().
+  let ptw_result = pt_walk(sv_width, vpn, access, priv, mxr, do_sum,
+                           base_ppn, initial_level, false, stage, ext_ptw);
+  match ptw_result {
+    Err(f, ext_ptw) => Err(f, ext_ptw),
+    Ok(struct {ppn, pte, pteAddr, level, pbmt, global}, ext_ptw) => {
+      // Step 9 of VATP.
+      match update_and_write_pte(sv_width, pteAddr, pte, access, stage, ext_ptw) {
+        Ok(PTE_Update_Done(Some(new_pte)), ext_ptw) => {
+          // Writeback the PTE (which has new A/D bits).  new_pte is the
+          // value the walk read with its new A/D bits (the update compared
+          // the PTE in memory with it), so the walk's ppn and pbmt
+          // describe new_pte as well.
+          add_to_TLB(sv_width, asid, vmid, vpn, ppn, new_pte, pteAddr, level, global, stage);
+          Ok(ppn, pbmt, ext_ptw)
+        },
+        Ok(PTE_Update_Done(None()), ext_ptw) => {
+          // There was no change in the PTE, but it still needs to be added
+          // to the TLB due to the TLB miss.
+          add_to_TLB(sv_width, asid, vmid, vpn, ppn, pte, pteAddr, level, global, stage);
+          Ok(ppn, pbmt, ext_ptw)
+        },
+        Ok(PTE_Update_Retry(), ext_ptw) =>
+          // The PTE was changed between the walk's read and the update's
+          // exclusive read: "If the comparison fails, return to step 2."
+          if retries > 0
+          then translate_TLB_miss_retry(retries - 1, sv_width, asid, vmid, base_ppn, vpn, access,
+                                        priv, mxr, do_sum, stage, ext_ptw)
+          else internal_error(__FILE__, __LINE__, "PTE A/D update: retry bound exhausted"),
+        Err(e, ext_ptw) => Err(e, ext_ptw),
+      }
+    },
+  }
+}
+
+termination_measure translate_TLB_miss_retry(retries, _, _, _, _, _, _, _, _, _, _, _) = retries
+
+// Translate on TLB miss (do a page-table walk)
+private function translate_TLB_miss forall 'v, is_sv_or_svx4_mode('v) . (
+  sv_width : int('v),
+  asid     : asidbits,
+  vmid     : vmidbits,
+  base_ppn : ppn_bits('v),
+  vpn      : vpn_bits('v),
+  access   : MemoryAccessType(mem_payload),
+  priv     : Privilege,
+  mxr      : bool,
+  do_sum   : bool,
+  stage    : TranslationStage,
+  ext_ptw  : ext_ptw,
+) -> TR_Result(ppn_bits('v), PTW_Error) =
+  translate_TLB_miss_retry(pte_update_max_retries, sv_width, asid, vmid, base_ppn, vpn, access,
+                           priv, mxr, do_sum, stage, ext_ptw)
+
 // This function can be ignored on first reading since TLBs are not
 // part of RISC-V architecture spec (see TLB NOTE above).
 // Translate on TLB hit, and maintenance of PTE in TLB
 private function translate_TLB_hit forall 'v, is_sv_or_svx4_mode('v) . (
   sv_width  : int('v),
-  _asid     : asidbits,
-  _vmid     : vmidbits,
+  asid      : asidbits,
+  vmid      : vmidbits,
+  base_ppn  : ppn_bits('v),
   vpn       : vpn_bits('v),
   access    : MemoryAccessType(mem_payload),
   priv      : Privilege,
@@ -508,63 +590,21 @@ private function translate_TLB_hit forall 'v, is_sv_or_svx4_mode('v) . (
       Err(ext_get_ptw_error(pte_failure), ext_ptw),
     PTE_Check_Success(ext_ptw) => {
       // Step 9 of VATP.  The A/D-bit update is performed atomically on
-      // the PTE in memory (see update_and_write_pte()); if the in-memory
-      // PTE no longer passes the tablewalk checks (i.e. it was modified
-      // since this TLB entry was filled), the update raises a page fault
-      // instead of writing back a stale TLB copy of the PTE.
-      match update_and_write_pte(sv_width, vpn, ent.pteAddr, pte, tlb_get_level(sv_width, ent),
-                                 access, priv, mxr, do_sum, stage, ext_ptw) {
-        Ok(Some(pte), ext_ptw) => {
+      // the PTE in memory (see update_and_write_pte()), compared with the
+      // cached copy; if the in-memory PTE differs from the cached copy
+      // (it was modified since this TLB entry was filled) the copy is
+      // stale, and the translation walks the page table instead (the walk
+      // refills this TLB slot) rather than writing a stale copy back.
+      match update_and_write_pte(sv_width, ent.pteAddr, pte, access, stage, ext_ptw) {
+        Ok(PTE_Update_Done(Some(pte)), ext_ptw) => {
           // Writeback the PTE (which has new A/D bits).
           write_TLB(tlb_index, tlb_set_pte(ent, pte : bits('pte_size * 8)));
           Ok(tlb_get_ppn(sv_width, ent, vpn), tlb_get_pbmt(ent), ext_ptw)
         },
-        Ok(None(), ext_ptw) => Ok(tlb_get_ppn(sv_width, ent, vpn), tlb_get_pbmt(ent), ext_ptw),
-        Err(e, ext_ptw) => Err(e, ext_ptw),
-      }
-    },
-  }
-}
-
-// Translate on TLB miss (do a page-table walk)
-private function translate_TLB_miss forall 'v, is_sv_or_svx4_mode('v) . (
-  sv_width : int('v),
-  asid     : asidbits,
-  vmid     : vmidbits,
-  base_ppn : ppn_bits('v),
-  vpn      : vpn_bits('v),
-  access   : MemoryAccessType(mem_payload),
-  priv     : Privilege,
-  mxr      : bool,
-  do_sum   : bool,
-  stage    : TranslationStage,
-  ext_ptw  : ext_ptw,
-) -> TR_Result(ppn_bits('v), PTW_Error) = {
-  let initial_level = get_root_level(sv_width);
-
-  // Step 2 of VATP occurs in pt_walk().
-  let ptw_result = pt_walk(sv_width, vpn, access, priv, mxr, do_sum,
-                           base_ppn, initial_level, false, stage, ext_ptw);
-  match ptw_result {
-    Err(f, ext_ptw) => Err(f, ext_ptw),
-    Ok(struct {ppn, pte, pteAddr, level, pbmt, global}, ext_ptw) => {
-      // Step 9 of VATP.
-      match update_and_write_pte(sv_width, vpn, pteAddr, pte, level,
-                                 access, priv, mxr, do_sum, stage, ext_ptw) {
-        Ok(Some(new_pte), ext_ptw) => {
-          // Writeback the PTE (which has new A/D bits).  In the absence
-          // of a concurrent update of the PTE, the fresh value read by
-          // update_and_write_pte() equals the value read by the walk, so
-          // the walk's ppn and pbmt describe new_pte as well.
-          add_to_TLB(sv_width, asid, vmid, vpn, ppn, new_pte, pteAddr, level, global, stage);
-          Ok(ppn, pbmt, ext_ptw)
-        },
-        Ok(None(), ext_ptw) => {
-          // There was no change in the PTE, but it still needs to be added
-          // to the TLB due to the TLB miss.
-          add_to_TLB(sv_width, asid, vmid, vpn, ppn, pte, pteAddr, level, global, stage);
-          Ok(ppn, pbmt, ext_ptw)
-        },
+        Ok(PTE_Update_Done(None()), ext_ptw) => Ok(tlb_get_ppn(sv_width, ent, vpn), tlb_get_pbmt(ent), ext_ptw),
+        Ok(PTE_Update_Retry(), ext_ptw) =>
+          translate_TLB_miss(sv_width, asid, vmid, base_ppn, vpn, access, priv,
+                             mxr, do_sum, stage, ext_ptw),
         Err(e, ext_ptw) => Err(e, ext_ptw),
       }
     },
@@ -603,7 +643,7 @@ private function translate forall 'v, is_sv_or_svx4_mode('v) . (
   // On first reading, assume lookup_TLB returns None(), since TLBs
   // are not part of RISC-V architecture spec (see TLB NOTE above)
   match lookup_TLB(sv_width, asid, vmid, vpn, stage) {
-    Some(index, ent) => translate_TLB_hit(sv_width, asid, vmid, vpn, access, priv,
+    Some(index, ent) => translate_TLB_hit(sv_width, asid, vmid, base_ppn, vpn, access, priv,
                                           mxr, do_sum, index, ent, stage, ext_ptw),
     None()           => {
       generate_event(EV_TLB_MISS);
